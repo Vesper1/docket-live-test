@@ -1,0 +1,79 @@
+# Docket — rebuild a bounded deployment history from retained run artifacts.
+#
+# Supply exact Docket deploy workflow run IDs. This is an audit projection, not
+# a database: expired or omitted artifacts are outside the resulting history.
+name: Docket deployment history
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_ids:
+        description: JSON array of Docket deploy workflow run IDs
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # The exact engine this repository trusts. Never a bare package name: the
+  # public `docket` package on npm is something else entirely.
+  DOCKET_ENGINE_REF: ${{ vars.DOCKET_ENGINE_REF }}
+  DOCKET: docket
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Temporary, until the engine is published: this repository builds the
+      # exact commit it trusts, into the runner's temporary directory rather
+      # than the candidate workspace. It then becomes the one-line
+      # `npm install --global "$DOCKET_ENGINE_REF"` the templates ship with.
+      - name: Build the pinned Docket engine
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKET_ENGINE_REF:-}" ]; then
+            echo "Set the DOCKET_ENGINE_REF repository variable to the exact Docket commit this repository trusts." >&2
+            exit 1
+          fi
+          git clone --quiet https://github.com/Vesper1/docket.git "$RUNNER_TEMP/docket-engine"
+          git -C "$RUNNER_TEMP/docket-engine" checkout --quiet "$DOCKET_ENGINE_REF"
+          cd "$RUNNER_TEMP/docket-engine"
+          corepack enable
+          pnpm install --frozen-lockfile
+          # `npm pack` runs the build; installing the packed tarball is the one
+          # form that always yields a working `docket` binary.
+          npm install --global "$(npm pack --silent)"
+
+      - name: Retrieve the exact deployment artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_IDS: ${{ inputs.run_ids }}
+        run: |
+          set -euo pipefail
+          echo "$RUN_IDS" | jq -e 'type == "array" and length > 0 and all(.[]; type == "number" and . > 0 and floor == .)' > /dev/null
+          mkdir -p "$RUNNER_TEMP/docket-history-input"
+          echo "$RUN_IDS" | jq -r '.[]' | while IFS= read -r run_id; do
+            gh run download "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern 'docket-deployment-*' \
+              --dir "$RUNNER_TEMP/docket-history-input/$run_id"
+          done
+
+      - name: Verify every bundle and build the history
+        run: |
+          $DOCKET history \
+            --runs "$RUNNER_TEMP/docket-history-input" \
+            --out "$RUNNER_TEMP/docket-history"
+
+      - name: Upload the bounded history projection
+        uses: actions/upload-artifact@v4
+        with:
+          name: docket-history-${{ github.run_id }}
+          path: ${{ runner.temp }}/docket-history
+          if-no-files-found: error

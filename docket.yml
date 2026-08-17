@@ -1,0 +1,25 @@
+# Read from the base commit of every pull request, never from the candidate.
+version: 1
+sourceRoot: force-app
+apiVersion: '62.0'
+
+environments:
+  qa:
+    # A pull request must target this branch to reach the QA org.
+    branch: main
+    # The alias the workflow authenticates as, never a credential.
+    org: docket-qa
+    allowDestructiveChanges: false
+    tests:
+      mode: specified
+      classes:
+        - DocketFixtureTest
+    gates:
+      - name: apex-naming
+        run: |
+          set -euo pipefail
+          ! grep -rln "TODO" force-app/main/default/classes || {
+            echo "An Apex class still carries a TODO marker." >&2
+            exit 1
+          }
+        timeoutMinutes: 2
