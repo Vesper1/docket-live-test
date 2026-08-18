@@ -8202,6 +8202,9 @@ function escape(value) {
 
 // src/lib/features/plan/deployment-plan.ts
 var PLAN_SCHEMA = "docket.plan/v1";
+function planChangesMetadata(plan) {
+  return plan.components.deployable.length > 0 || plan.components.destructive.length > 0;
+}
 
 // src/lib/features/plan/report.ts
 function renderReport(plan) {
@@ -8345,7 +8348,8 @@ function validationRecordOf(input) {
       failures.push(`${failure.className}.${failure.method}: ${failure.message}`);
     }
   }
-  if (deployment === null && failures.length === 0) {
+  const salesforce = input.salesforce ?? "validated";
+  if (salesforce === "validated" && deployment === null && failures.length === 0) {
     failures.push("Salesforce validation did not run");
   }
   return {
@@ -8355,6 +8359,7 @@ function validationRecordOf(input) {
     org: { reference: input.plan.target.org, id: input.plan.target.orgId },
     tests: input.plan.tests,
     steps: input.steps,
+    salesforce,
     deployment,
     failures
   };
@@ -8465,12 +8470,13 @@ function isValidationRecord(value) {
   const org = asRecord2(validation?.["org"]);
   const deployment = validation?.["deployment"];
   const failures = validation?.["failures"];
-  if (validation?.["schema"] !== VALIDATION_SCHEMA || !verdict(validation["verdict"]) || !matches(validation["planIdentity"], DIGEST) || !text2(org?.["reference"]) || !isSalesforceOrgId(org?.["id"]) || !isTestSelection(validation["tests"]) || !isStepResults(validation["steps"]) || !(deployment === null || isDeploymentOutcome(deployment)) || !stringArray(failures)) {
+  if (validation?.["schema"] !== VALIDATION_SCHEMA || !verdict(validation["verdict"]) || !matches(validation["planIdentity"], DIGEST) || !text2(org?.["reference"]) || !isSalesforceOrgId(org?.["id"]) || !isTestSelection(validation["tests"]) || !isStepResults(validation["steps"]) || !oneOf(validation["salesforce"], ["validated", "not-required"]) || !(deployment === null || isDeploymentOutcome(deployment)) || !stringArray(failures)) {
     return false;
   }
   if (deployment !== null && deployment.checkOnly !== true) return false;
+  if (validation["salesforce"] === "not-required" && deployment !== null) return false;
   if (validation["verdict"] === "passed") {
-    return failures.length === 0 && deployment !== null && deployment.success && !validation["steps"].some((step) => step.status === "failed");
+    return failures.length === 0 && (validation["salesforce"] === "not-required" || deployment !== null && deployment.success) && !validation["steps"].some((step) => step.status === "failed");
   }
   return failures.length > 0;
 }
@@ -8487,11 +8493,14 @@ function isRunRecord(value) {
   }
   if (run["executor"] === "local" ? workflow !== null : workflow === null) return false;
   if (validation === null) return false;
+  const emptyPlan = run["plan"].components.deployable.length === 0 && run["plan"].components.destructive.length === 0;
+  if (emptyPlan !== (validation.salesforce === "not-required")) return false;
   if (run["kind"] === "validate") {
     return run["status"] === validation.verdict && deployment === null && mergeCommit === null && sameJson(run["steps"], validation.steps);
   }
   if (deployment !== null && deployment.checkOnly) return false;
-  const failed = deployment === null || !deployment.success || run["steps"].some((step) => step.status === "failed" || step.status === "pending");
+  if (emptyPlan && deployment !== null) return false;
+  const failed = !emptyPlan && (deployment === null || !deployment.success) || run["steps"].some((step) => step.status === "failed" || step.status === "pending");
   return run["status"] === (failed ? "failed" : "passed");
 }
 function isDeploymentOutcome(value) {
@@ -9890,7 +9899,7 @@ async function deployRun(request) {
         if (before.results.some((step) => step.status === "failed")) {
           return ok({ steps: before.results, logs: before.logs, deployment: null });
         }
-        const deployment = await runDeployment(
+        const deployment = planChangesMetadata(plan) ? await runDeployment(
           { ...request.cli, cwd: candidateWorkspace.directory },
           "deploy",
           {
@@ -9900,7 +9909,7 @@ async function deployRun(request) {
             tests: plan.tests,
             waitMinutes: request.waitMinutes
           }
-        );
+        ) : ok(null);
         if (!deployment.ok) return deployment;
         const after = await runSteps(trusted.value.postDeployment, {
           cwd: trustedWorkspace.directory,
@@ -9935,7 +9944,8 @@ async function deployRun(request) {
   return ok(run);
 }
 function recordOf(request, plan, validation, steps2, deployment) {
-  const failed = deployment === null || !deployment.success || steps2.some((step) => step.status === "failed");
+  const missingAnswer = planChangesMetadata(plan) && deployment === null;
+  const failed = missingAnswer || deployment !== null && !deployment.success || steps2.some((step) => step.status === "failed");
   return {
     schema: RUN_SCHEMA,
     kind: request.kind ?? "deploy",
@@ -11487,7 +11497,20 @@ async function validateRun(request) {
     { cwd: request.repositoryDirectory, sha: plan.plan.source.headSha },
     async (workspace) => {
       if (request.gates.results.some((step) => step.status !== "passed")) {
-        return ok({ steps: request.gates.results, logs: request.gates.logs, deployment: null });
+        return ok({
+          steps: request.gates.results,
+          logs: request.gates.logs,
+          deployment: null,
+          salesforce: "validated"
+        });
+      }
+      if (!planChangesMetadata(plan.plan)) {
+        return ok({
+          steps: [...request.gates.results, ...manualSteps(plan.plan)],
+          logs: request.gates.logs,
+          deployment: null,
+          salesforce: "not-required"
+        });
       }
       const deployment = await runDeployment(
         { ...request.cli, cwd: workspace.directory },
@@ -11501,22 +11524,11 @@ async function validateRun(request) {
         }
       );
       if (!deployment.ok) return deployment;
-      const manual = plan.plan.steps.preDeployment.flatMap(
-        (step) => step.kind === "manual" ? [
-          {
-            name: step.name,
-            kind: "pre",
-            manual: true,
-            status: "pending",
-            exitCode: null,
-            completedBy: null
-          }
-        ] : []
-      );
       return ok({
-        steps: [...request.gates.results, ...manual],
+        steps: [...request.gates.results, ...manualSteps(plan.plan)],
         logs: request.gates.logs,
-        deployment: deployment.value
+        deployment: deployment.value,
+        salesforce: "validated"
       });
     }
   );
@@ -11524,7 +11536,8 @@ async function validateRun(request) {
   const validation = validationRecordOf({
     plan: plan.plan,
     steps: outcome2.value.steps,
-    deployment: outcome2.value.deployment
+    deployment: outcome2.value.deployment,
+    salesforce: outcome2.value.salesforce
   });
   const run = {
     schema: RUN_SCHEMA,
@@ -11548,6 +11561,20 @@ async function validateRun(request) {
   });
   if (!written.ok) return written;
   return ok(run);
+}
+function manualSteps(plan) {
+  return plan.steps.preDeployment.flatMap(
+    (step) => step.kind === "manual" ? [
+      {
+        name: step.name,
+        kind: "pre",
+        manual: true,
+        status: "pending",
+        exitCode: null,
+        completedBy: null
+      }
+    ] : []
+  );
 }
 async function writeManifests(directory, prepared) {
   await mkdir7(directory, { recursive: true });
