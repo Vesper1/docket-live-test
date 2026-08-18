@@ -11,9 +11,9 @@ environments:
     org: docket-qa
     allowDestructiveChanges: false
     tests:
-      mode: specified
-      classes:
-        - DocketFixtureTest
+      # Every local test, so a newly added class is covered by the run that
+      # deploys it. A Developer Edition org enforces coverage like production.
+      mode: all
     gates:
       - name: apex-naming
         run: |
