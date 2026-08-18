@@ -7663,6 +7663,10 @@ var FLAGS = {
     type: "string",
     description: "Minutes to wait for Salesforce (default: 33)"
   },
+  failed: {
+    type: "string",
+    description: "Publish a failing check for a run that recorded nothing"
+  },
   "validated-run": {
     type: "string",
     description: "Artifacts directory of the validation to deploy"
@@ -7820,7 +7824,12 @@ function messageOf2(body) {
 var VALIDATION_CHECK_NAME = "docket/validate";
 var STEP_CHECK_SCHEMA = "docket.step-check/v1";
 async function publishValidationCheck(client, request) {
-  const externalId = encodeExternalId(request.workflowRunId, request.planIdentity);
+  if (request.planIdentity === null && request.verdict === "passed") {
+    return err(
+      docketError(ErrorCode.planMismatch, "refusing to publish a passing check for no plan")
+    );
+  }
+  const externalId = request.planIdentity === null ? void 0 : encodeExternalId(request.workflowRunId, request.planIdentity);
   const response = await githubRequest(client, {
     method: "POST",
     path: `/repos/${request.repository}/check-runs`,
@@ -7829,7 +7838,7 @@ async function publishValidationCheck(client, request) {
       head_sha: request.headSha,
       status: "completed",
       conclusion: request.verdict === "passed" ? "success" : "failure",
-      external_id: externalId,
+      ...externalId === void 0 ? {} : { external_id: externalId },
       ...request.detailsUrl === void 0 ? {} : { details_url: request.detailsUrl },
       output: {
         title: request.verdict === "passed" ? "Validation passed" : "Validation failed",
@@ -7848,7 +7857,7 @@ async function publishValidationCheck(client, request) {
     name: text(body?.["name"]) ?? VALIDATION_CHECK_NAME,
     headSha: text(body?.["head_sha"]) ?? request.headSha,
     conclusion: text(body?.["conclusion"]) ?? "",
-    externalId
+    externalId: externalId ?? ""
   });
 }
 async function publishStepCheck(client, request) {
@@ -7968,10 +7977,14 @@ async function findOriginatingRun(client, repository2, headSha) {
   }
   const ours = checks.filter((check) => decodeExternalId(text(check["external_id"])) !== void 0);
   if (ours.length === 0) {
+    const failed = checks.find((check) => text(check["conclusion"]) !== "success");
     return err(
-      docketError(
+      failed === void 0 ? docketError(
         ErrorCode.githubFailed,
         `no ${VALIDATION_CHECK_NAME} check for ${headSha} names its workflow run`
+      ) : docketError(
+        ErrorCode.validationNotPassed,
+        `the ${VALIDATION_CHECK_NAME} check for ${headSha} concluded ${text(failed["conclusion"]) ?? "nothing"}`
       )
     );
   }
@@ -10638,6 +10651,8 @@ async function writePlanArtifacts(directory, artifacts) {
 var flags10 = flagsFor(
   "repository",
   "validated-run",
+  "head",
+  "failed",
   "workflow-run-id",
   "details-url",
   "github-token"
@@ -10649,6 +10664,11 @@ var publishCheckCommand = defineCommand({
   run: async (options, context) => {
     const repository2 = requiredOption(options.repository, "--repository");
     if (!repository2.ok) return repository2;
+    const client = githubClientOf(options, context);
+    if (!client.ok) return client;
+    if (options.failed !== void 0) {
+      return publishFailure(client.value, repository2.value, options);
+    }
     const directory = requiredOption(options["validated-run"], "--validated-run");
     if (!directory.ok) return directory;
     const workflowRunId = requiredOption(options["workflow-run-id"], "--workflow-run-id");
@@ -10663,8 +10683,6 @@ var publishCheckCommand = defineCommand({
         )
       );
     }
-    const client = githubClientOf(options, context);
-    if (!client.ok) return client;
     const published = await publishValidationCheck(client.value, {
       repository: repository2.value,
       headSha: run.value.plan.source.headSha,
@@ -10690,6 +10708,23 @@ var publishCheckCommand = defineCommand({
     return ok({ kind: "check", check: published.value });
   }
 });
+async function publishFailure(client, repository2, options) {
+  const headSha = requiredOption(options["head"], "--head");
+  if (!headSha.ok) return headSha;
+  const workflowRunId = requiredOption(options["workflow-run-id"], "--workflow-run-id");
+  if (!workflowRunId.ok) return workflowRunId;
+  const published = await publishValidationCheck(client, {
+    repository: repository2,
+    headSha: headSha.value,
+    verdict: "failed",
+    planIdentity: null,
+    workflowRunId: workflowRunId.value,
+    summary: `Docket validation could not complete: ${options.failed ?? ""}`,
+    ...options["details-url"] === void 0 ? {} : { detailsUrl: options["details-url"] }
+  });
+  if (!published.ok) return published;
+  return ok({ kind: "check", check: published.value });
+}
 function summarize(run) {
   const failures = run.validation?.failures ?? [];
   if (failures.length === 0) return `Docket validation ${run.status}.`;
