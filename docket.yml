@@ -9,7 +9,10 @@ environments:
     branch: main
     # The alias the workflow authenticates as, never a credential.
     org: docket-qa
-    allowDestructiveChanges: false
+    # Deletions are allowed in QA and nowhere else by default. Turning this on
+    # changes every plan's identity, so anything validated under the old policy
+    # has to be validated again.
+    allowDestructiveChanges: true
     tests:
       # Every local test, so a newly added class is covered by the run that
       # deploys it. A Developer Edition org enforces coverage like production.
