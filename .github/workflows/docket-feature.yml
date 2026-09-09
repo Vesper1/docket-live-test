@@ -1,0 +1,124 @@
+name: Docket feature
+run-name: Docket ${{ inputs.operation }} · PR ${{ inputs.pr }}
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        required: true
+        options:
+          [plan, validate, start, continue, confirm, run-step, retry-step]
+      pr:
+        description: Pull request number
+        type: string
+        required: true
+      run_id:
+        description: Deployment ID from Plan / UI
+        type: string
+      revision:
+        description: State commit SHA shown by Docket
+        type: string
+      step_id:
+        description: Step ID for confirm / run-step / retry-step
+        type: string
+      comment:
+        description: Manual evidence or retry reason
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+# Job serialization complements the persisted org lock across manual pauses.
+concurrency:
+  group: docket-feature-v1
+  cancel-in-progress: false
+
+jobs:
+  feature:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Plan resolves metadata without Salesforce credentials or org approval.
+    environment: ${{ inputs.operation != 'plan' && vars.DOCKET_ENVIRONMENT || '' }}
+    steps:
+      - name: Check trusted settings
+        env:
+          ENGINE_SHA: ${{ vars.DOCKET_ENGINE_SHA }}
+          CONFIG_SHA: ${{ vars.DOCKET_CONFIG_SHA }}
+          PR_NUMBER: ${{ inputs.pr }}
+          ENVIRONMENT: ${{ vars.DOCKET_ENVIRONMENT }}
+        run: |
+          set -euo pipefail
+          [[ "$ENGINE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CONFIG_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ -n "$ENVIRONMENT" ]]
+
+      - name: Checkout reviewed Docket engine
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ vars.DOCKET_ENGINE_REPOSITORY }}
+          ref: ${{ vars.DOCKET_ENGINE_SHA }}
+          path: engine
+          persist-credentials: false
+          # For a private engine repository configure a read-only token.
+          token: ${{ secrets.DOCKET_ENGINE_TOKEN || github.token }}
+
+      - name: Checkout feature source as data
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ inputs.pr }}/head
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Install reviewed runtime dependencies
+        working-directory: engine
+        run: npm ci --ignore-scripts
+
+      - name: Install Salesforce CLI
+        if: inputs.operation != 'plan'
+        run: npm install --global @salesforce/cli@2.148.3
+
+      - name: Authenticate Salesforce
+        if: inputs.operation != 'plan'
+        env:
+          DOCKET_SF_AUTH_URL: ${{ secrets.DOCKET_SF_AUTH_URL }}
+        run: |
+          set -euo pipefail
+          umask 077
+          auth_file="$RUNNER_TEMP/docket-auth.txt"
+          trap 'rm -f "$auth_file"' EXIT
+          printf '%s' "$DOCKET_SF_AUTH_URL" > "$auth_file"
+          sf org login sfdx-url --sfdx-url-file "$auth_file" --alias docket-target
+
+      - name: Run shared deployment operation
+        working-directory: engine
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKET_ENGINE_SHA: ${{ vars.DOCKET_ENGINE_SHA }}
+          DOCKET_CONFIG_SHA: ${{ vars.DOCKET_CONFIG_SHA }}
+          DOCKET_BASELINE_SHA: ${{ vars.DOCKET_BASELINE_SHA }}
+          DOCKET_SOURCE: ${{ github.workspace }}/source
+          DOCKET_OUTPUT: ${{ runner.temp }}/docket-feature
+          DOCKET_PR: ${{ inputs.pr }}
+          DOCKET_OPERATION: ${{ inputs.operation }}
+          DOCKET_RUN_ID: ${{ inputs.run_id }}
+          DOCKET_REVISION: ${{ inputs.revision }}
+          DOCKET_STEP_ID: ${{ inputs.step_id }}
+          DOCKET_COMMENT: ${{ inputs.comment }}
+        run: node src/runner.ts
+
+      - name: Publish evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docket-feature-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/docket-feature
+          retention-days: 30
+          if-no-files-found: warn
